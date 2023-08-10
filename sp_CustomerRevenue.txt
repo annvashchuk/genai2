@@ -1,0 +1,341 @@
+Hello!
+ChatGPT
+Hello! How can I assist you today?
+
+
+
+
+User
+I got WideWorldImportersDW-Standard DB provided by Microsoft. I need to write stored procedure based on the entities from this DB. I'll provide requirements in the next message.
+ChatGPT
+Of course! Please provide the requirements for the stored procedure you need, and I'll do my best to help you craft the SQL code for it based on the WideWorldImportersDW-Standard database schema.
+
+
+
+
+User
+It is required to create a stored procedure that calculates customer revenue based on the provided input parameters. The stored procedure should accept the following input parameters: 
+1.  FromYear: integer; the year from which to start the calculation.  
+Acceptable values: 2020, 2021, 2022, etc. If input parameter is not passed, the earliest available year in the data set should be used by default. 
+2. ToYear: integer; the year to which the calculation should be made.  
+Acceptable values: 2020, 2021, 2022, etc. If input parameter is not passed, the latest available year in the data set should be used by default. 
+3. Period: varchar; period for which customer revenue should be aggregated (month, quarter, year).  Acceptable values: ‘Month’, ’M’, ‘Quarter’, ‘Q’, ‘Year’, ‘Y’. If input parameter is not passed, year should be used by default. 
+4. CustomerID: integer; the ID of the customer for which revenue needs to be calculated. If the input parameter is not passed, all the customers should be included in the result set. 
+5. The stored procedure should retrieve relevant sales data from the database based on the input parameters. 
+6. The revenue should be calculated by summing the total sales amount for the specified customer within the given time period (based on the input parameter). The formula for sales amount is Quantity * Unit Price. 
+7. The result set should be inserted to the newly created SQL table. The table should contain the following columns:  
+[CustomerID] (int) 
+[CustomerName] (varchar(50)) 
+[Period] (varchar(8)) 
+[Revenue] (numeric(19,2)) 
+8. SQL table name should consist of customer ID, customer name, start year, end year and period identifier, for example: ‘1_SoftServe_2019_2022_M’ or ‘1_SoftServe_2019_2022_Q’ or ‘1_SoftServe_2019_2022_Y’. 
+If the stored procedure was executed for one year, table name should contain only one year, for example ‘1_SoftServe_2022_M’. 
+If stored procedure was executed for all customers, table name should contain prefix ‘All’, start year, end year and period identifier. For example, ‘All_2019_2022_Y’. 
+9. The table should be created during each execution of stored procedure. If the table with the given name already exists – it should be dropped and recreated. 
+
+Depends on the chosen period, periods data in the result set should be represented as following:  
+
+For month: MM YYYY (for example, Jan 2022) 
+For quarter: ‘Q’+ QuarterNumber+ ‘ ‘ + YYYY (for example, Q1 2022)
+For year: YYYY (for example, 2022) 
+
+If no sales data is found for the specified customer within the given time period, the revenue should be set to zero. 
+
+The stored procedure should handle any errors or exceptions and provide appropriate error messages. Errors should be written to [ErrorLog] table, which should contain following columns:  
+
+[ErrorID] (int) 
+[ErrorNumber] (int) 
+[ErrorSeverity] (int) 
+[ErrorMessage] (varchar(255)) 
+[CustomerID] (int) 
+[Period] (varchar(8)) 
+[CreatedAt] (datetime) 
+
+The error table should be created during the first execution of stored procedure, so there should be the logic to check if error table already exists.  
+ChatGPT
+Given your detailed requirements, here's a solution:
+
+Create the stored procedure:
+sql
+Copy code
+CREATE PROCEDURE sp_CalculateCustomerRevenue
+    @FromYear INT = NULL,
+    @ToYear INT = NULL,
+    @Period VARCHAR(10) = 'Year',
+    @CustomerID INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    BEGIN TRY
+        -- Step 1: Declare and set the default values for the input parameters
+        IF @FromYear IS NULL
+            SET @FromYear = (SELECT MIN(YEAR(OrderDate)) FROM FactOrder);
+
+        IF @ToYear IS NULL
+            SET @ToYear = (SELECT MAX(YEAR(OrderDate)) FROM FactOrder);
+
+        -- Step 2: Declare the table name based on input parameters
+        DECLARE @TableName NVARCHAR(255);
+        SET @TableName = ISNULL(CAST(@CustomerID AS NVARCHAR(10)), 'All') + '_' +
+                         ISNULL((SELECT CustomerName FROM DimensionCustomer WHERE CustomerID = @CustomerID), 'All') + '_' +
+                         CAST(@FromYear AS NVARCHAR(4)) + '_' + 
+                         (CASE WHEN @FromYear = @ToYear THEN '' ELSE CAST(@ToYear AS NVARCHAR(4)) END) + '_' +
+                         LEFT(@Period, 1);
+
+        -- Step 3: Check if the table exists, if it does drop it
+        IF OBJECT_ID('[' + @TableName + ']', 'U') IS NOT NULL
+            EXEC('DROP TABLE [' + @TableName + ']');
+
+        -- Step 4: Based on the period input, generate the SQL to create and insert data
+        DECLARE @SQL NVARCHAR(MAX);
+
+        SET @SQL = 'CREATE TABLE [' + @TableName + '] ([CustomerID] INT, [CustomerName] VARCHAR(50), [Period] VARCHAR(8), [Revenue] NUMERIC(19,2));';
+
+        SET @SQL = @SQL + ' INSERT INTO [' + @TableName + '] 
+                           SELECT 
+                               dc.CustomerID,
+                               dc.CustomerName,';
+
+        IF @Period IN ('Month', 'M')
+            SET @SQL = @SQL + ' DATENAME(MONTH, fo.OrderDate) + '' '' + CAST(YEAR(fo.OrderDate) AS VARCHAR(4)) AS [Period],';
+        ELSE IF @Period IN ('Quarter', 'Q')
+            SET @SQL = @SQL + ' ''Q'' + DATENAME(QUARTER, fo.OrderDate) + '' '' + CAST(YEAR(fo.OrderDate) AS VARCHAR(4)) AS [Period],';
+        ELSE 
+            SET @SQL = @SQL + ' CAST(YEAR(fo.OrderDate) AS VARCHAR(4)) AS [Period],';
+
+        SET @SQL = @SQL + ' SUM(fo.Quantity * fo.UnitPrice) AS Revenue
+                           FROM FactOrder fo
+                           JOIN DimensionCustomer dc ON fo.CustomerID = dc.CustomerID
+                           WHERE YEAR(fo.OrderDate) BETWEEN @FromYear AND @ToYear' +
+                           (CASE WHEN @CustomerID IS NOT NULL THEN ' AND dc.CustomerID = @CustomerID' ELSE '' END) +
+                           ' GROUP BY dc.CustomerID, dc.CustomerName';
+
+        IF @Period IN ('Month', 'M')
+            SET @SQL = @SQL + ', MONTH(fo.OrderDate), YEAR(fo.OrderDate)';
+        ELSE IF @Period IN ('Quarter', 'Q')
+            SET @SQL = @SQL + ', DATENAME(QUARTER, fo.OrderDate), YEAR(fo.OrderDate)';
+        ELSE 
+            SET @SQL = @SQL + ', YEAR(fo.OrderDate)';
+
+        EXEC sp_executesql @SQL, N'@FromYear INT, @ToYear INT, @CustomerID INT', @FromYear, @ToYear, @CustomerID;
+
+    END TRY
+
+    BEGIN CATCH
+        IF OBJECT_ID('[ErrorLog]', 'U') IS NULL
+        BEGIN
+            CREATE TABLE [ErrorLog]
+            (
+                [ErrorID] INT PRIMARY KEY IDENTITY,
+                [ErrorNumber] INT,
+                [ErrorSeverity] INT,
+                [ErrorMessage] VARCHAR(255),
+                [CustomerID] INT,
+                [Period] VARCHAR(8),
+                [CreatedAt] DATETIME DEFAULT GETDATE()
+            );
+        END
+
+        INSERT INTO [ErrorLog] ([ErrorNumber], [ErrorSeverity], [ErrorMessage], [CustomerID], [Period])
+        VALUES (ERROR_NUMBER(), ERROR_SEVERITY(), ERROR_MESSAGE(), @CustomerID, LEFT(@Period, 1));
+
+    END CATCH
+END;
+To execute the stored procedure, use the following:
+sql
+Copy code
+EXEC sp_CalculateCustomerRevenue @FromYear=2020, @ToYear=2022, @Period='Month', @CustomerID=1;
+Note: You may need to adjust the table and column names to match the exact schema of the WideWorldImportersDW-Standard database. This is a complex task, so ensure that you thoroughly test the procedure in a non-production environment before deploying it.
+
+
+
+
+User
+Tables names are: Dimension.Customer and Fact.Order. Can you please rewrite stored procedure accordingly?
+ChatGPT
+Of course! Let's rewrite the stored procedure to match the correct table names (Dimension.Customer and Fact.Order).
+
+sql
+Copy code
+CREATE PROCEDURE sp_CalculateCustomerRevenue
+    @FromYear INT = NULL,
+    @ToYear INT = NULL,
+    @Period VARCHAR(10) = 'Year',
+    @CustomerID INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    BEGIN TRY
+        -- Step 1: Declare and set the default values for the input parameters
+        IF @FromYear IS NULL
+            SET @FromYear = (SELECT MIN(YEAR(OrderDate)) FROM Fact.Order);
+
+        IF @ToYear IS NULL
+            SET @ToYear = (SELECT MAX(YEAR(OrderDate)) FROM Fact.Order);
+
+        -- Step 2: Declare the table name based on input parameters
+        DECLARE @TableName NVARCHAR(255);
+        SET @TableName = ISNULL(CAST(@CustomerID AS NVARCHAR(10)), 'All') + '_' +
+                         ISNULL((SELECT CustomerName FROM Dimension.Customer WHERE CustomerID = @CustomerID), 'All') + '_' +
+                         CAST(@FromYear AS NVARCHAR(4)) + '_' + 
+                         (CASE WHEN @FromYear = @ToYear THEN '' ELSE CAST(@ToYear AS NVARCHAR(4)) END) + '_' +
+                         LEFT(@Period, 1);
+
+        -- Step 3: Check if the table exists, if it does drop it
+        IF OBJECT_ID('[' + @TableName + ']', 'U') IS NOT NULL
+            EXEC('DROP TABLE [' + @TableName + ']');
+
+        -- Step 4: Based on the period input, generate the SQL to create and insert data
+        DECLARE @SQL NVARCHAR(MAX);
+
+        SET @SQL = 'CREATE TABLE [' + @TableName + '] ([CustomerID] INT, [CustomerName] VARCHAR(50), [Period] VARCHAR(8), [Revenue] NUMERIC(19,2));';
+
+        SET @SQL = @SQL + ' INSERT INTO [' + @TableName + '] 
+                           SELECT 
+                               dc.CustomerID,
+                               dc.CustomerName,';
+
+        IF @Period IN ('Month', 'M')
+            SET @SQL = @SQL + ' DATENAME(MONTH, fo.OrderDate) + '' '' + CAST(YEAR(fo.OrderDate) AS VARCHAR(4)) AS [Period],';
+        ELSE IF @Period IN ('Quarter', 'Q')
+            SET @SQL = @SQL + ' ''Q'' + DATENAME(QUARTER, fo.OrderDate) + '' '' + CAST(YEAR(fo.OrderDate) AS VARCHAR(4)) AS [Period],';
+        ELSE 
+            SET @SQL = @SQL + ' CAST(YEAR(fo.OrderDate) AS VARCHAR(4)) AS [Period],';
+
+        SET @SQL = @SQL + ' SUM(fo.Quantity * fo.UnitPrice) AS Revenue
+                           FROM Fact.Order fo
+                           JOIN Dimension.Customer dc ON fo.CustomerID = dc.CustomerID
+                           WHERE YEAR(fo.OrderDate) BETWEEN @FromYear AND @ToYear' +
+                           (CASE WHEN @CustomerID IS NOT NULL THEN ' AND dc.CustomerID = @CustomerID' ELSE '' END) +
+                           ' GROUP BY dc.CustomerID, dc.CustomerName';
+
+        IF @Period IN ('Month', 'M')
+            SET @SQL = @SQL + ', MONTH(fo.OrderDate), YEAR(fo.OrderDate)';
+        ELSE IF @Period IN ('Quarter', 'Q')
+            SET @SQL = @SQL + ', DATENAME(QUARTER, fo.OrderDate), YEAR(fo.OrderDate)';
+        ELSE 
+            SET @SQL = @SQL + ', YEAR(fo.OrderDate)';
+
+        EXEC sp_executesql @SQL, N'@FromYear INT, @ToYear INT, @CustomerID INT', @FromYear, @ToYear, @CustomerID;
+
+    END TRY
+
+    BEGIN CATCH
+        IF OBJECT_ID('[ErrorLog]', 'U') IS NULL
+        BEGIN
+            CREATE TABLE [ErrorLog]
+            (
+                [ErrorID] INT PRIMARY KEY IDENTITY,
+                [ErrorNumber] INT,
+                [ErrorSeverity] INT,
+                [ErrorMessage] VARCHAR(255),
+                [CustomerID] INT,
+                [Period] VARCHAR(8),
+                [CreatedAt] DATETIME DEFAULT GETDATE()
+            );
+        END
+
+        INSERT INTO [ErrorLog] ([ErrorNumber], [ErrorSeverity], [ErrorMessage], [CustomerID], [Period])
+        VALUES (ERROR_NUMBER(), ERROR_SEVERITY(), ERROR_MESSAGE(), @CustomerID, LEFT(@Period, 1));
+
+    END CATCH
+END;
+Now the stored procedure is written to match the schema of the Dimension.Customer and Fact.Order tables. Make sure you test the procedure thoroughly in a non-production environment before deploying.
+
+
+
+
+User
+Can you please change some column names? [Customer Key] instead of CustomerID, [Order Date Key] instead of OrderDate, [Unit Price] instead of UnitPrice, Customer instead of CustomerName. Also, use table name Fact.[Order] instead of Fact.Order
+ChatGPT
+Certainly! Let's modify the stored procedure to match the revised column names and table references.
+
+sql
+Copy code
+CREATE PROCEDURE sp_CalculateCustomerRevenue
+    @FromYear INT = NULL,
+    @ToYear INT = NULL,
+    @Period VARCHAR(10) = 'Year',
+    @CustomerKey INT = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    BEGIN TRY
+        -- Step 1: Declare and set the default values for the input parameters
+        IF @FromYear IS NULL
+            SET @FromYear = (SELECT MIN(YEAR([Order Date Key])) FROM Fact.[Order]);
+
+        IF @ToYear IS NULL
+            SET @ToYear = (SELECT MAX(YEAR([Order Date Key])) FROM Fact.[Order]);
+
+        -- Step 2: Declare the table name based on input parameters
+        DECLARE @TableName NVARCHAR(255);
+        SET @TableName = ISNULL(CAST(@CustomerKey AS NVARCHAR(10)), 'All') + '_' +
+                         ISNULL((SELECT Customer FROM Dimension.Customer WHERE [Customer Key] = @CustomerKey), 'All') + '_' +
+                         CAST(@FromYear AS NVARCHAR(4)) + '_' + 
+                         (CASE WHEN @FromYear = @ToYear THEN '' ELSE CAST(@ToYear AS NVARCHAR(4)) END) + '_' +
+                         LEFT(@Period, 1);
+
+        -- Step 3: Check if the table exists, if it does drop it
+        IF OBJECT_ID('[' + @TableName + ']', 'U') IS NOT NULL
+            EXEC('DROP TABLE [' + @TableName + ']');
+
+        -- Step 4: Based on the period input, generate the SQL to create and insert data
+        DECLARE @SQL NVARCHAR(MAX);
+
+        SET @SQL = 'CREATE TABLE [' + @TableName + '] ([Customer Key] INT, Customer VARCHAR(50), [Period] VARCHAR(8), [Revenue] NUMERIC(19,2));';
+
+        SET @SQL = @SQL + ' INSERT INTO [' + @TableName + '] 
+                           SELECT 
+                               dc.[Customer Key],
+                               dc.Customer,';
+
+        IF @Period IN ('Month', 'M')
+            SET @SQL = @SQL + ' DATENAME(MONTH, fo.[Order Date Key]) + '' '' + CAST(YEAR(fo.[Order Date Key]) AS VARCHAR(4)) AS [Period],';
+        ELSE IF @Period IN ('Quarter', 'Q')
+            SET @SQL = @SQL + ' ''Q'' + DATENAME(QUARTER, fo.[Order Date Key]) + '' '' + CAST(YEAR(fo.[Order Date Key]) AS VARCHAR(4)) AS [Period],';
+        ELSE 
+            SET @SQL = @SQL + ' CAST(YEAR(fo.[Order Date Key]) AS VARCHAR(4)) AS [Period],';
+
+        SET @SQL = @SQL + ' SUM(fo.Quantity * fo.[Unit Price]) AS Revenue
+                           FROM Fact.[Order] fo
+                           JOIN Dimension.Customer dc ON fo.[Customer Key] = dc.[Customer Key]
+                           WHERE YEAR(fo.[Order Date Key]) BETWEEN @FromYear AND @ToYear' +
+                           (CASE WHEN @CustomerKey IS NOT NULL THEN ' AND dc.[Customer Key] = @CustomerKey' ELSE '' END) +
+                           ' GROUP BY dc.[Customer Key], dc.Customer';
+
+        IF @Period IN ('Month', 'M')
+            SET @SQL = @SQL + ', MONTH(fo.[Order Date Key]), YEAR(fo.[Order Date Key])';
+        ELSE IF @Period IN ('Quarter', 'Q')
+            SET @SQL = @SQL + ', DATENAME(QUARTER, fo.[Order Date Key]), YEAR(fo.[Order Date Key])';
+        ELSE 
+            SET @SQL = @SQL + ', YEAR(fo.[Order Date Key])';
+
+        EXEC sp_executesql @SQL, N'@FromYear INT, @ToYear INT, @CustomerKey INT', @FromYear, @ToYear, @CustomerKey;
+
+    END TRY
+
+    BEGIN CATCH
+        IF OBJECT_ID('[ErrorLog]', 'U') IS NULL
+        BEGIN
+            CREATE TABLE [ErrorLog]
+            (
+                [ErrorID] INT PRIMARY KEY IDENTITY,
+                [ErrorNumber] INT,
+                [ErrorSeverity] INT,
+                [ErrorMessage] VARCHAR(255),
+                [Customer Key] INT,
+                [Period] VARCHAR(8),
+                [CreatedAt] DATETIME DEFAULT GETDATE()
+            );
+        END
+
+        INSERT INTO [ErrorLog] ([ErrorNumber], [ErrorSeverity], [ErrorMessage], [Customer Key], [Period])
+        VALUES (ERROR_NUMBER(), ERROR_SEVERITY(), ERROR_MESSAGE(), @CustomerKey, LEFT(@Period, 1));
+
+    END CATCH
+END;
+The changes have been made as per your specifications. Always ensure to test thoroughly in a non-production environment before deploying.
